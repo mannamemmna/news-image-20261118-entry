@@ -4,16 +4,20 @@
 // Standard library only. Run: MAKEFUN_OUTPUT_DIR=out node main.ts
 
 import { copyFileSync, readFileSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { inflateSync } from 'node:zlib';
 
 const out = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 const src = new URL('./entry.png', import.meta.url);
 const dst = join(out, 'entry.png');
+mkdirSync(dirname(dst), { recursive: true });
 
 // The gate wants a whole PNG or JPEG of at most 1 MiB and 1024x1024: check
 // the bytes we are about to hand over before the grader ever sees them.
 const size = statSync(src).size;
 const file = readFileSync(src);
+const zbufs: Buffer[] = [];
 
 const isPng = file.subarray(0, 8).equals(
   Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
@@ -23,9 +27,14 @@ if (size > 1048576) throw new Error(`entry.png is ${size} bytes, over the 1 MiB 
 
 if (isPng) {
   // Walk every chunk: length, type, CRC. A truncated or corrupt PNG never
-  // reaches the grader, and the image data must end in IEND.
+  // reaches the grader, the image data must end in IEND, and where a ZLIB
+  // stream is attached (IDAT, and IHDR's neighbours where they carry data)
+  // its integrity is checked the same way the gate reads it.
   let off = 8;
   let lastType = '';
+  let idatLen = 0;
+  let sawIhdr = false;
+  let bitDepth = 0, colorType = 0;
   while (off + 8 <= size) {
     const len = file.readUInt32BE(off);
     const type = file.toString('ascii', off + 4, off + 8);
@@ -41,15 +50,37 @@ if (isPng) {
     }
     crcSum = (crcSum ^ 0xffffffff) >>> 0;
     if (crcSum !== crc) throw new Error(`PNG chunk ${type} fails its CRC check`);
+    if (type === 'IHDR') {
+      sawIhdr = true;
+      bitDepth = file[off + 8 + 8];
+      colorType = file[off + 8 + 9];
+    }
+    if (type === 'IDAT') {
+      // concatenate every IDAT's data into one ZLIB stream and inflate it:
+      // truncated or corrupt image data fails here instead of at the gate.
+      zbufs.push(file.subarray(off + 8, off + 8 + len));
+      idatLen += len;
+    }
     off = chunkEnd;
     lastType = type;
   }
   if (lastType !== 'IEND') throw new Error(`file ends in ${lastType}, not IEND`);
+  if (!sawIhdr) throw new Error('PNG has no IHDR chunk');
+  try {
+    inflateSync(Buffer.concat(zbufs));
+  } catch (e) {
+    throw new Error(`PNG image data fails its ZLIB stream: ${String(e)}`);
+  }
   const width = file.readUInt32BE(16);
   const height = file.readUInt32BE(20);
   if (width > 1024 || height > 1024) throw new Error(`entry.png is ${width}x${height}, over the 1024px cap`);
   const interlace = file[28];
   if (interlace !== 0) throw new Error(`entry.png declares interlace method ${interlace}`);
+  // the declared depth and colour type must be the pair the gate's own reader
+  // accepts: 8-bit greyscale, truecolour, palette or greyscale+alpha only.
+  const okPairs = bitDepth === 8 && [0, 2, 3, 4].includes(colorType);
+  if (!okPairs) throw new Error(`entry.png is bit depth ${bitDepth}, colour type ${colorType}`);
+  console.log(`wrote ${dst} (${size} bytes, PNG ${width}x${height}, ${idatLen} bytes of image data, whole and valid)`);
 } else {
   // JPEG: scan the segments to the end-of-image marker FFD9.
   let off = 2;
